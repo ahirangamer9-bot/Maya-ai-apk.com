@@ -1,0 +1,8 @@
+{
+  "name": "Maya AI",
+  "description": "Maya AI - Your Personal AI Assistant featuring smart Hindi and English AI chat, voice assistant, camera scan, study helper, coding, journal, and tools.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

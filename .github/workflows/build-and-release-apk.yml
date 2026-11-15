@@ -1,0 +1,195 @@
+name: Build & Release Android APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      release_title:
+        description: 'Optional custom release title'
+        required: false
+        default: ''
+      release_notes:
+        description: 'Optional custom release notes'
+        required: false
+        default: ''
+
+# Least privilege: contents write is required to publish GitHub Releases
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-release:
+    name: Build & Publish Debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout the code
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Step 2: Set up JDK 21 (Temurin)
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      # Step 3: Set up Gradle with caching
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      # Step 4: Prepare environment files (.env from .env.example if missing)
+      - name: Prepare Environment Files
+        run: |
+          if [ ! -f ".env" ] && [ -f ".env.example" ]; then
+            echo "Copying .env.example to .env..."
+            cp .env.example .env
+          else
+            echo ".env file ready."
+          fi
+
+      # Step 5: Ensure Debug Keystore exists (Required by debugConfig in build.gradle.kts)
+      - name: Ensure Debug Keystore
+        run: |
+          if [ ! -f "debug.keystore" ]; then
+            echo "Generating temporary debug keystore for CI build..."
+            keytool -genkey -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+            echo "Debug keystore generated successfully."
+          else
+            echo "Existing debug.keystore detected."
+          fi
+
+      # Step 6: Grant execution permission for Gradlew
+      - name: Grant Execute Permission to Gradlew
+        run: chmod +x gradlew
+
+      # Step 7: Build the Debug APK using Gradle
+      - name: Build Debug APK
+        run: |
+          echo "Building Debug APK..."
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      # Step 8: Verify that the APK exists and is not empty
+      - name: Verify Generated APK
+        id: verify_apk
+        run: |
+          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
+
+          if [ ! -f "$APK_PATH" ]; then
+            # Search for any fallback apk if path differs
+            APK_PATH=$(find app/build/outputs/apk/debug -name "*.apk" -type f | head -n 1)
+          fi
+
+          if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
+            echo "::error::Build validation failed: No APK file was generated."
+            exit 1
+          fi
+
+          # Verify file is not empty (greater than 0 bytes)
+          if [ ! -s "$APK_PATH" ]; then
+            echo "::error::Build validation failed: The generated APK file is empty (0 bytes)."
+            exit 1
+          fi
+
+          FILE_SIZE=$(stat -c%s "$APK_PATH" 2>/dev/null || stat -f%z "$APK_PATH" 2>/dev/null)
+          echo "APK verified successfully: $APK_PATH"
+          echo "APK size: $FILE_SIZE bytes"
+
+          echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
+          echo "apk_size=$FILE_SIZE" >> "$GITHUB_OUTPUT"
+
+      # Step 9: Prepare Release Asset with clear and consistent naming
+      - name: Prepare Release Asset
+        id: prepare_asset
+        run: |
+          SRC_APK="${{ steps.verify_apk.outputs.apk_path }}"
+          RUN_NUM="${{ github.run_number }}"
+          DATE_STR=$(date +'%Y%m%d')
+
+          # Tag format: v1.0.<run_number> (unique per build)
+          RELEASE_TAG="v1.0.${RUN_NUM}"
+
+          # Clean filename for direct phone downloading
+          RELEASE_APK_NAME="Maya-AI-Assistant-v1.0.${RUN_NUM}-debug.apk"
+          LATEST_APK_NAME="Maya-AI-Assistant-latest-debug.apk"
+
+          mkdir -p release_assets
+          cp "$SRC_APK" "release_assets/$RELEASE_APK_NAME"
+          cp "$SRC_APK" "release_assets/$LATEST_APK_NAME"
+
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_apk_name=$RELEASE_APK_NAME" >> "$GITHUB_OUTPUT"
+          echo "release_apk_path=release_assets/$RELEASE_APK_NAME" >> "$GITHUB_OUTPUT"
+          echo "latest_apk_path=release_assets/$LATEST_APK_NAME" >> "$GITHUB_OUTPUT"
+
+      # Step 10: Upload APK as GitHub Actions Workflow Artifact
+      - name: Upload APK as Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepare_asset.outputs.release_apk_name }}
+          path: ${{ steps.prepare_asset.outputs.release_apk_path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      # Step 11: Publish the APK to GitHub Releases
+      - name: Publish to GitHub Releases
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.prepare_asset.outputs.release_tag }}
+          name: ${{ inputs.release_title != '' && inputs.release_title || format('Maya AI Assistant v1.0.{0} (Build #{0})', github.run_number) }}
+          draft: false
+          prerelease: false
+          files: |
+            ${{ steps.prepare_asset.outputs.release_apk_path }}
+            ${{ steps.prepare_asset.outputs.latest_apk_path }}
+          body: |
+            ${{ inputs.release_notes != '' && inputs.release_notes || '## 🚀 Maya AI Assistant - Automated Build' }}
+
+            ### 📱 Download & Install on Your Phone:
+            1. Under **Assets** below, tap **`${{ steps.prepare_asset.outputs.release_apk_name }}`** to download directly to your Android device.
+            2. Once downloaded, tap the file in your notification bar or **Downloads** folder.
+            3. If Android shows a prompt, select **Settings** -> **Allow from this source**.
+            4. Tap **Install** and open **Maya AI Assistant**!
+
+            ---
+
+            ### 📋 Build Summary:
+            - **Release Tag:** `${{ steps.prepare_asset.outputs.release_tag }}`
+            - **Build Number:** `#${{ github.run_number }}`
+            - **Commit SHA:** `${{ github.sha }}`
+            - **Branch:** `${{ github.ref_name }}`
+            - **APK File Size:** `${{ steps.verify_apk.outputs.apk_size }} bytes`
+            - **Build Date:** `${{ steps.prepare_asset.outputs.release_tag }}`
+
+      # Step 12: Verify Release Result
+      - name: Verify Release Result
+        run: |
+          echo "========================================================="
+          echo "🎉 GitHub Release Published Successfully!"
+          echo "Tag: ${{ steps.prepare_asset.outputs.release_tag }}"
+          echo "Asset: ${{ steps.prepare_asset.outputs.release_apk_name }}"
+          echo "Direct download is ready for your Android phone!"
+          echo "=========================================================="
